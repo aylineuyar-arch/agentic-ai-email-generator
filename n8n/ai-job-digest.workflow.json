@@ -1,0 +1,221 @@
+{
+  "name": "AI Job Digest - Daily 8AM",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 12 * * *" }
+          ]
+        }
+      },
+      "id": "trigger",
+      "name": "Daily 8AM ET",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const TITLES = ['AI Deployment Strategist', 'AI Strategy Lead', 'AI Deployment Lead'];\nconst LOCATIONS = ['New York', 'San Francisco', 'London'];\nconst queries = [];\nfor (const title of TITLES) {\n  for (const loc of LOCATIONS) {\n    queries.push({ json: { query: `${title} in ${loc}`, title, location: loc } });\n  }\n}\nreturn queries;"
+      },
+      "id": "build-queries",
+      "name": "Build Query Matrix",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "url": "=https://jsearch.p.rapidapi.com/search?query={{ encodeURIComponent($json.query) }}&page=1&num_pages=1&date_posted=week",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-RapidAPI-Key", "value": "={{ $env.RAPIDAPI_JSEARCH_KEY }}" },
+            { "name": "X-RapidAPI-Host", "value": "jsearch.p.rapidapi.com" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "neverError": true } }
+        }
+      },
+      "id": "jsearch",
+      "name": "JSearch API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.firecrawl.dev/v1/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.FIRECRAWL_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"query\": \"{{ $json.query }} site:builtin.com OR site:wellfound.com OR site:jobs.ashbyhq.com OR site:linkedin.com/jobs\",\n  \"limit\": 10\n}",
+        "options": {
+          "response": { "response": { "neverError": true } }
+        }
+      },
+      "id": "firecrawl",
+      "name": "Firecrawl Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 500]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "id": "merge",
+      "name": "Merge Sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const TITLE_KEYWORDS = [\n  'ai deployment strategist',\n  'ai deployment lead',\n  'ai strategy',\n  'ai strategist',\n  'deployment strategist',\n];\nfunction matches(t) { t = (t || '').toLowerCase(); return TITLE_KEYWORDS.some(k => t.includes(k)); }\nfunction makeKey(source, url, title, company) {\n  return `${source}::${url || `${company || ''}::${title}`}`.toLowerCase().slice(0, 500);\n}\nconst jobs = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (Array.isArray(j.data) && j.data[0]?.job_title !== undefined) {\n    for (const r of j.data) {\n      if (!matches(r.job_title)) continue;\n      jobs.push({\n        job_key: makeKey('jsearch', r.job_apply_link, r.job_title, r.employer_name),\n        title: r.job_title,\n        company: r.employer_name || null,\n        location: [r.job_city, r.job_state, r.job_country].filter(Boolean).join(', ') || null,\n        source: 'jsearch',\n        url: r.job_apply_link || null,\n        posted_at: r.job_posted_at_datetime_utc || null,\n      });\n    }\n  }\n  if (Array.isArray(j.data) && j.data[0]?.url !== undefined) {\n    for (const r of j.data) {\n      if (!matches(r.title)) continue;\n      jobs.push({\n        job_key: makeKey('firecrawl', r.url, r.title, null),\n        title: r.title,\n        company: null,\n        location: null,\n        source: 'firecrawl',\n        url: r.url,\n        posted_at: null,\n      });\n    }\n  }\n}\nconst seen = new Set();\nconst unique = jobs.filter(j => { if (seen.has(j.job_key)) return false; seen.add(j.job_key); return true; });\nreturn unique.map(json => ({ json }));"
+      },
+      "id": "normalize",
+      "name": "Normalize & Filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT job_key FROM seen_jobs WHERE job_key = ANY(string_to_array($1, ','))",
+        "options": {
+          "queryReplacement": "={{ $items().map(i => i.json.job_key).join(',') }}"
+        }
+      },
+      "id": "check-seen",
+      "name": "Check Seen Jobs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 400],
+      "notes": "Configure Postgres credential pointing to Railway Postgres or the Lovable Cloud DB"
+    },
+    {
+      "parameters": {
+        "jsCode": "const seen = new Set(($('Check Seen Jobs').all() || []).map(i => i.json.job_key));\nconst fresh = $('Normalize & Filter').all().filter(i => !seen.has(i.json.job_key));\nreturn fresh;"
+      },
+      "id": "filter-new",
+      "name": "Keep Only New",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 400]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": { "__rl": true, "value": "public", "mode": "list" },
+        "table": { "__rl": true, "value": "seen_jobs", "mode": "list" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "job_key": "={{ $json.job_key }}",
+            "title": "={{ $json.title }}",
+            "company": "={{ $json.company }}",
+            "location": "={{ $json.location }}",
+            "source": "={{ $json.source }}",
+            "url": "={{ $json.url }}",
+            "posted_at": "={{ $json.posted_at }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "insert-seen",
+      "name": "Insert seen_jobs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1780, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const jobs = $('Keep Only New').all().map(i => i.json);\nif (jobs.length === 0) return [{ json: { skip: true, count: 0 } }];\nconst rows = jobs.map(j => `<tr><td style=\"padding:8px;border-bottom:1px solid #eee\"><a href=\"${j.url || '#'}\" style=\"color:#1a73e8;text-decoration:none;font-weight:600\">${j.title}</a><br><span style=\"color:#666;font-size:13px\">${j.company || ''} ${j.location ? '— ' + j.location : ''}</span><br><span style=\"color:#999;font-size:12px\">${j.source}</span></td></tr>`).join('');\nconst html = `<!doctype html><html><body style=\"font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:640px;margin:0 auto;padding:24px\"><h2 style=\"color:#111\">${jobs.length} new AI Deployment role${jobs.length===1?'':'s'} today</h2><table style=\"width:100%;border-collapse:collapse\">${rows}</table><p style=\"color:#999;font-size:12px;margin-top:24px\">Sent by your n8n job-hunting agent</p></body></html>`;\nreturn [{ json: { skip: false, count: jobs.length, html, subject: `${jobs.length} new AI Deployment role${jobs.length===1?'':'s'}` } }];"
+      },
+      "id": "build-digest",
+      "name": "Build Email Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": false,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-has-jobs",
+      "name": "Has New Jobs?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2000, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.resend.com/emails",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.RESEND_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"from\": \"AI Job Agent <onboarding@resend.dev>\",\n  \"to\": [\"aylin.e.uyar@gmail.com\"],\n  \"subject\": \"{{ $json.subject }}\",\n  \"html\": {{ JSON.stringify($json.html) }}\n}",
+        "options": {}
+      },
+      "id": "send-email",
+      "name": "Send via Resend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2220, 240]
+    }
+  ],
+  "connections": {
+    "Daily 8AM ET": { "main": [[{ "node": "Build Query Matrix", "type": "main", "index": 0 }]] },
+    "Build Query Matrix": {
+      "main": [[
+        { "node": "JSearch API", "type": "main", "index": 0 },
+        { "node": "Firecrawl Search", "type": "main", "index": 0 }
+      ]]
+    },
+    "JSearch API": { "main": [[{ "node": "Merge Sources", "type": "main", "index": 0 }]] },
+    "Firecrawl Search": { "main": [[{ "node": "Merge Sources", "type": "main", "index": 1 }]] },
+    "Merge Sources": { "main": [[{ "node": "Normalize & Filter", "type": "main", "index": 0 }]] },
+    "Normalize & Filter": { "main": [[{ "node": "Check Seen Jobs", "type": "main", "index": 0 }]] },
+    "Check Seen Jobs": { "main": [[{ "node": "Keep Only New", "type": "main", "index": 0 }]] },
+    "Keep Only New": {
+      "main": [[
+        { "node": "Build Email Digest", "type": "main", "index": 0 },
+        { "node": "Insert seen_jobs", "type": "main", "index": 0 }
+      ]]
+    },
+    "Build Email Digest": { "main": [[{ "node": "Has New Jobs?", "type": "main", "index": 0 }]] },
+    "Has New Jobs?": { "main": [[{ "node": "Send via Resend", "type": "main", "index": 0 }], []] }
+  },
+  "settings": { "executionOrder": "v1" }
+}
